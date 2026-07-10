@@ -630,33 +630,16 @@ def _filter_read_blocked_search_results(result, task_id: str = "default") -> int
     return omitted
 
 
-# Paths that file tools should refuse to write to without going through the
-# terminal tool's approval system.  These match prefixes after os.path.realpath.
+# System paths that file tools should refuse to write to without going through
+# the terminal tool's approval system. These match prefixes after
+# os.path.realpath. User-owned Hermes configuration is intentionally not in
+# this list: blocking it here is not a security boundary because the terminal
+# tool and ``hermes config`` run as the same OS user.
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
     "/private/etc/", "/private/var/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
-
-_hermes_config_resolved: str | None = None
-_hermes_config_resolved_loaded = False
-
-
-def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
-    try:
-        from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
-    except Exception:
-        try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
-        except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -675,17 +658,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
     return None
 
 

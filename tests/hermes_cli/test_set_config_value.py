@@ -126,6 +126,52 @@ class TestConfigYamlRouting:
 
 
 # ---------------------------------------------------------------------------
+# Structured values
+# ---------------------------------------------------------------------------
+
+class TestStructuredValues:
+    """Explicit list/map syntax must round-trip as YAML collections."""
+
+    def test_json_list_is_saved_as_list(self, _isolated_hermes_home):
+        set_config_value(
+            "fallback_providers",
+            '[{"provider":"openai-codex","model":"gpt-test"}]',
+        )
+
+        import yaml
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["fallback_providers"] == [
+            {"provider": "openai-codex", "model": "gpt-test"}
+        ]
+
+    def test_json_map_is_saved_as_map(self, _isolated_hermes_home):
+        set_config_value("custom_settings", '{"enabled":true,"limit":3}')
+
+        import yaml
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["custom_settings"] == {"enabled": True, "limit": 3}
+
+    def test_structured_value_contents_are_not_echoed(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value(
+            "custom_providers",
+            '[{"name":"example","api_key":"do-not-print"}]',
+        )
+
+        captured = capsys.readouterr()
+        assert "do-not-print" not in captured.out
+        assert "<list>" in captured.out
+
+    def test_malformed_structured_value_is_rejected(
+        self, _isolated_hermes_home
+    ):
+        with pytest.raises(SystemExit):
+            set_config_value("fallback_providers", '[{"provider":')
+        assert "fallback_providers" not in _read_config(_isolated_hermes_home)
+
+
+# ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277
 # ---------------------------------------------------------------------------
 

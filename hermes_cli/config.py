@@ -8146,17 +8146,39 @@ def set_config_value(key: str, value: str):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
-    # Convert value to appropriate type
-    if value.lower() in {'true', 'yes', 'on'}:
-        value = True
+    # Convert value to the appropriate type. Structured JSON/YAML values are
+    # accepted so callers can set list/map fields (for example
+    # ``fallback_providers``) without the value being serialized as a quoted
+    # string. Only opt into YAML parsing for explicit collection syntax so
+    # ordinary strings keep their historical behavior.
+    parsed_value: Any = value
+    _stripped_value = value.strip()
+    if _stripped_value.startswith(("[", "{")):
+        try:
+            _structured_value = fast_safe_load(value)
+        except Exception as exc:
+            print(
+                f"Invalid structured value for '{key}': {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(_structured_value, (list, dict)):
+            print(
+                f"Invalid structured value for '{key}': expected a list or map.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        parsed_value = _structured_value
+    elif value.lower() in {'true', 'yes', 'on'}:
+        parsed_value = True
     elif value.lower() in {'false', 'no', 'off'}:
-        value = False
+        parsed_value = False
     elif value.isdigit():
-        value = int(value)
+        parsed_value = int(value)
     elif value.replace('.', '', 1).isdigit():
-        value = float(value)
+        parsed_value = float(value)
 
-    _set_nested(user_config, key, value)
+    _set_nested(user_config, key, parsed_value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
@@ -8175,18 +8197,22 @@ def set_config_value(key: str, value: str):
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
     if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+        save_env_value(env_var, _terminal_env_value(parsed_value))
 
     # Mask the echoed value when the (possibly nested) key is credential-shaped
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if isinstance(parsed_value, (list, dict)):
+        # Structured values can contain nested credentials. Confirm the type
+        # without echoing their contents back to terminal logs.
+        _display_value = f"<{type(parsed_value).__name__}>"
+    elif _leaf_key in _SECRET_CONFIG_KEYS and isinstance(parsed_value, str) and parsed_value:
         from agent.redact import mask_secret
-        _display_value = mask_secret(value)
+        _display_value = mask_secret(parsed_value)
     else:
-        _display_value = value
+        _display_value = parsed_value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
 
 
