@@ -1134,13 +1134,12 @@ class TestBuildApprovalText:
             title="t",
             command_preview="rm -rf /tmp/demo",
             cwd="/home/user",
-            timeout_sec=60,
         )
         text = build_approval_text(req)
         assert "命令执行审批" in text
         assert "rm -rf /tmp/demo" in text
         assert "/home/user" in text
-        assert "60" in text
+        assert "不会自动超时" in text
 
     def test_plugin_approval_uses_severity_icon(self):
         from gateway.platforms.qqbot.keyboards import (
@@ -1148,7 +1147,7 @@ class TestBuildApprovalText:
         )
         crit = ApprovalRequest(
             session_key="s", title="dangerous op",
-            severity="critical", tool_name="shell", timeout_sec=30,
+            severity="critical", tool_name="shell",
         )
         assert "🔴" in build_approval_text(crit)
 

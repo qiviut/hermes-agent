@@ -285,7 +285,7 @@ class ApprovalRequest:
     :param cwd: Working directory (exec approvals).
     :param tool_name: Tool name (plugin approvals).
     :param severity: ``'critical' | 'info' | ''``.
-    :param timeout_sec: Seconds until the approval expires.
+
     """
     session_key: str
     title: str
@@ -294,7 +294,7 @@ class ApprovalRequest:
     cwd: str = ""
     tool_name: str = ""
     severity: str = ""
-    timeout_sec: int = 120
+
 
 
 def build_approval_text(req: ApprovalRequest) -> str:
@@ -316,7 +316,7 @@ def _build_exec_text(req: ApprovalRequest) -> str:
     if req.description:
         lines.append(f"📝 {req.description}")
     lines.append("")
-    lines.append(f"⏱️ 超时: {req.timeout_sec} 秒")
+    lines.append("⏳ 等待你的明确决定（不会自动超时）")
     return "\n".join(lines)
 
 
@@ -333,7 +333,7 @@ def _build_plugin_text(req: ApprovalRequest) -> str:
     if req.tool_name:
         lines.append(f"🔧 工具: {req.tool_name}")
     lines.append("")
-    lines.append(f"⏱️ 超时: {req.timeout_sec} 秒")
+    lines.append("⏳ 等待你的明确决定（不会自动超时）")
     return "\n".join(lines)
 
 

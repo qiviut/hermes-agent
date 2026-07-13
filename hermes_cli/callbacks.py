@@ -200,8 +200,6 @@ def approval_callback(cli, command: str, description: str) -> str:
         lock = cli._approval_lock
 
     with lock:
-        from cli import CLI_CONFIG
-        timeout = CLI_CONFIG.get("approvals", {}).get("timeout", 60)
         response_queue = queue.Queue()
         choices = ["once", "session", "always", "deny"]
         if len(command) > 70:
@@ -214,29 +212,22 @@ def approval_callback(cli, command: str, description: str) -> str:
             "selected": 0,
             "response_queue": response_queue,
         }
-        cli._approval_deadline = _time.monotonic() + timeout
+        cli._approval_deadline = 0
 
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
 
+        from tools.interrupt import is_interrupted
         while True:
             try:
-                result = response_queue.get(timeout=1)
-                cli._approval_state = None
-                cli._approval_deadline = 0
-                if hasattr(cli, "_app") and cli._app:
-                    cli._app.invalidate()
-                return result
+                result = response_queue.get(timeout=0.25)
+                break
             except queue.Empty:
-                remaining = cli._approval_deadline - _time.monotonic()
-                if remaining <= 0:
+                if is_interrupted():
+                    result = "interrupted"
                     break
-                if hasattr(cli, "_app") and cli._app:
-                    cli._app.invalidate()
-
         cli._approval_state = None
         cli._approval_deadline = 0
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
-        cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-        return "deny"
+        return result

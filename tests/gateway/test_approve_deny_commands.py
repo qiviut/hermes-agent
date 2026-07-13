@@ -172,8 +172,8 @@ class TestBlockingGatewayApproval:
         assert e1.event.is_set()
         assert e2.event.is_set()
 
-    def test_clear_session_denies_and_signals_all_entries(self):
-        """clear_session must wake blocked entries during boundary cleanup."""
+    def test_clear_session_interrupts_and_signals_all_entries(self):
+        """Boundary cleanup wakes blocked entries without fabricating denial."""
         from tools.approval import clear_session, _ApprovalEntry, _gateway_queues
 
         session_key = "test-boundary-cleanup"
@@ -185,8 +185,8 @@ class TestBlockingGatewayApproval:
 
         assert e1.event.is_set()
         assert e2.event.is_set()
-        assert e1.result == "deny"
-        assert e2.result == "deny"
+        assert e1.result == "interrupted"
+        assert e2.result == "interrupted"
         assert session_key not in _gateway_queues
 
 
@@ -515,19 +515,12 @@ class TestBlockingApprovalE2E:
         assert "BLOCKED" in result_holder[0]["message"]
         unregister_gateway_notify(session_key)
 
-    @pytest.mark.parametrize(
-        "approval_config",
-        [
-            {"mode": "manual", "timeout": 0},
-            {"mode": "manual", "timeout": 0, "gateway_timeout": 300},
-        ],
-        ids=["shared-timeout-only", "shared-timeout-is-canonical"],
-    )
-    def test_blocking_approval_uses_canonical_timeout(self, approval_config, monkeypatch):
-        """Gateway waits use approvals.timeout, without a second timeout knob."""
+    def test_blocking_approval_ignores_legacy_timeout_config(self, monkeypatch):
+        """Legacy timeout values must not resolve user consent."""
         from tools import approval as approval_module
         from tools.approval import (
             check_all_command_guards,
+            has_blocking_approval,
             register_gateway_notify,
             reset_current_session_key,
             resolve_gateway_approval,
@@ -536,9 +529,9 @@ class TestBlockingApprovalE2E:
         )
 
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
-        session_key = "e2e-timeout"
-        register_gateway_notify(session_key, lambda d: None)
-
+        session_key = "e2e-no-timeout"
+        notified = threading.Event()
+        register_gateway_notify(session_key, lambda _d: notified.set())
         result_holder = [None]
 
         def agent_thread():
@@ -549,7 +542,7 @@ class TestBlockingApprovalE2E:
             try:
                 with patch(
                     "tools.approval._get_approval_config",
-                    return_value=approval_config,
+                    return_value={"mode": "manual", "gateway_timeout": 1, "timeout": 1},
                 ):
                     result_holder[0] = check_all_command_guards(
                         "rm -rf /important", "local"
@@ -562,14 +555,18 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        t.join(timeout=1)
-        if t.is_alive():
-            resolve_gateway_approval(session_key, "deny")
-            t.join(timeout=5)
+        assert notified.wait(timeout=5)
+        time.sleep(1.2)
+        assert t.is_alive(), "legacy timeout unexpectedly resolved approval"
+        assert has_blocking_approval(session_key)
 
-        assert result_holder[0]["approved"] is False
-        assert result_holder[0]["outcome"] == "timeout"
-        assert "timed out" in result_holder[0]["message"]
+        resolve_gateway_approval(session_key, "deny")
+        t.join(timeout=5)
+        assert not t.is_alive()
+        result = result_holder[0]
+        assert result is not None
+        assert result["approved"] is False
+        assert result["outcome"] == "denied"
         unregister_gateway_notify(session_key)
 
     def test_parallel_subagent_approvals(self):

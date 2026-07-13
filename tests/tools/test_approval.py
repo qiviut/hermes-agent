@@ -1711,7 +1711,6 @@ class TestFailClosedUnderPromptToolkit:
                     prompt_dangerous_approval(
                         "rm -rf /",
                         "test danger",
-                        timeout_seconds=30,
                         approval_callback=None,
                     )
                 )
@@ -2118,31 +2117,26 @@ class TestEtcPatternsUnaffectedByRefactor:
 
 
 # =========================================================================
-# Gateway approval timeout = deny, NOT consent (#24912)
+# Pending gateway approval is neither consent nor denial (#24912)
 #
 # A Slack user walked away mid-conversation; the agent requested approval
 # to run `rm -rf .git`; the prompt timed out; the agent ran the command
 # anyway. Reported by @tofalck on 2026-05-13, corroborated by
 # @angry-programmer on Telegram. Silence is not consent.
 #
-# These tests pin:
-#   1. Gateway timeout → approved=False, with a message strong enough that
-#      a downstream agent reading "BLOCKED: ... Silence is not consent."
-#      treats it as a hard halt, not an invitation to rephrase.
-#   2. The structured outcome / user_consent fields are present so
-#      plugins, hooks, and audit pipelines can act on the timeout without
-#      string-parsing the message.
-#   3. Explicit /deny carries the same shape (treat-as-not-consented).
+# These tests pin that silence leaves the exact request pending and produces no
+# tool result at all. Only an explicit deny or session interrupt returns a
+# model-facing BLOCKED outcome.
 # =========================================================================
 
 
-class TestApprovalTimeoutIsNotConsent:
-    """The gateway approval contract: silence is not consent (#24912)."""
+class TestPendingApprovalIsNotConsent:
+    """The gateway approval contract: silence leaves consent pending."""
 
     SESSION_KEY = "test-no-consent-session"
 
     def setup_method(self):
-        """Reset module state and force a tight approval timeout for fast tests."""
+        """Reset module state for each approval wait."""
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
@@ -2175,59 +2169,41 @@ class TestApprovalTimeoutIsNotConsent:
             else:
                 os.environ[k] = v
 
-    def _force_short_timeout(self, monkeypatch, seconds=1):
+    def test_legacy_timeout_config_does_not_resolve_pending_consent(self, monkeypatch):
+        """A stale timeout setting cannot convert silence into a decision."""
         from tools import approval as mod
+
         monkeypatch.setattr(
             mod, "_get_approval_config",
-            lambda: {"mode": "manual", "timeout": seconds},
+            lambda: {"mode": "manual", "gateway_timeout": 1, "timeout": 1},
         )
 
-    def test_timeout_returns_approved_false_with_no_consent(self, monkeypatch):
-        """The reported #24912 scenario — user never responds, agent must see BLOCKED."""
-        from tools import approval as mod
-
-        self._force_short_timeout(monkeypatch, seconds=1)
-
-        # Slack-shaped: notify_cb registered, but user doesn't respond.
         notified = []
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        result_holder = {}
 
-        result = mod.check_all_command_guards("rm -rf .git", "local")
+        def _check():
+            result_holder["result"] = mod.check_all_command_guards("rm -rf .git", "local")
 
-        assert result["approved"] is False
-        assert result.get("user_consent") is False
-        assert result.get("outcome") == "timeout"
-        # The notify_cb DID fire — we did try to ask the user.
+        thread = threading.Thread(target=_check)
+        thread.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+        time.sleep(1.1)
+
+        assert thread.is_alive()
+        assert "result" not in result_holder
+        assert mod.has_blocking_approval(self.SESSION_KEY)
         assert len(notified) == 1
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
-    def test_timeout_message_is_emphatic_against_retry_and_rephrase(self, monkeypatch):
-        """The BLOCKED message must explicitly tell the agent not to rephrase.
-
-        Without this, the agent treats 'Do NOT retry this command' as
-        permission to try a different command achieving the same outcome.
-        """
+    def test_explicit_deny_carries_no_consent_shape(self):
+        """An explicit /deny returns a hard, model-facing BLOCKED outcome."""
         from tools import approval as mod
-        self._force_short_timeout(monkeypatch, seconds=1)
-        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
-
-        result = mod.check_all_command_guards("rm -rf .git", "local")
-
-        msg = result["message"]
-        # Explicit halt signals — these are the model-facing contract.
-        assert "BLOCKED" in msg
-        assert "NOT consented" in msg
-        assert "Silence is not consent" in msg
-        # Both forms of evasion must be named:
-        assert "do NOT retry" in msg.lower() or "Do NOT retry" in msg
-        assert "rephrase" in msg.lower()
-        assert "different command" in msg.lower()
-
-    def test_explicit_deny_carries_same_no_consent_shape(self, monkeypatch):
-        """An explicit /deny must produce the same shape as timeout —
-        the agent should treat both identically."""
-        from tools import approval as mod
-
-        self._force_short_timeout(monkeypatch, seconds=60)
 
         notified = []
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
@@ -2256,14 +2232,9 @@ class TestApprovalTimeoutIsNotConsent:
         assert "NOT consented" in r["message"]
         assert "rephrase" in r["message"].lower()
 
-    def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
-        """Plugins must be able to distinguish timeout from explicit deny.
-
-        This is what an audit / notification plugin needs to alert
-        operators on 'agent asked, user never replied' incidents like #24912.
-        """
+    def test_explicit_deny_emits_post_hook_with_deny_outcome(self, monkeypatch):
+        """Audit hooks record the explicit decision, never a synthetic timeout."""
         from tools import approval as mod
-        self._force_short_timeout(monkeypatch, seconds=1)
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
 
         hook_calls = []
@@ -2274,16 +2245,24 @@ class TestApprovalTimeoutIsNotConsent:
             return original_fire(event_name, **kwargs)
 
         monkeypatch.setattr(mod, "_fire_approval_hook", _capture)
+        result_holder = {}
 
-        mod.check_all_command_guards("rm -rf .git", "local")
+        def _check():
+            result_holder["result"] = mod.check_all_command_guards("rm -rf .git", "local")
 
-        # post_approval_response must be in the hook log with choice=timeout
+        thread = threading.Thread(target=_check)
+        thread.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
         posts = [c for c in hook_calls if c[0] == "post_approval_response"]
         assert posts, "post_approval_response hook did not fire"
-        last_post = posts[-1][1]
-        assert last_post.get("choice") == "timeout", (
-            f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
-        )
+        assert posts[-1][1].get("choice") == "deny"
 
 
 class TestTirithImportErrorFailOpenPolicy:

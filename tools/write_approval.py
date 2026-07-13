@@ -376,8 +376,8 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
         return True
     if choice == "deny":
         return False
-    # Any other outcome (e.g. timeout that returns "deny" already handled) →
-    # treat unknown as no-decision so we stage rather than silently drop.
+    # Any other outcome (for example an interruption) is no decision, so stage
+    # the write rather than silently dropping it or rewriting it as a denial.
     return None
 
 

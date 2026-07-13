@@ -4640,11 +4640,11 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_choice = str(body.get("choice", "")).strip().lower()
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        allowed = {"once", "session", "always", "deny", "safer_alternative"}
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: once, session, always, deny, safer_alternative",
                     code="invalid_approval_choice",
                 ),
                 status=400,

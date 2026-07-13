@@ -25,10 +25,9 @@ class TestMcpReloadConfirmDefault:
         assert DEFAULT_CONFIG["approvals"]["mcp_reload_confirm"] is True
 
     def test_shape_matches_other_approval_keys(self):
-        # Same flat dict level as `mode` / `timeout` / `cron_mode`.
         approvals = DEFAULT_CONFIG["approvals"]
         assert isinstance(approvals.get("mode"), str)
-        assert isinstance(approvals.get("timeout"), int)
+        assert "timeout" not in approvals
         assert isinstance(approvals.get("cron_mode"), str)
         assert isinstance(approvals.get("mcp_reload_confirm"), bool)
 

@@ -44,8 +44,10 @@ Environment variables:
     MATRIX_APPROVAL_REQUIRE_SENDER
                               Require reaction controls to come from the original requester
                               when requester metadata is available (default: true)
-    MATRIX_APPROVAL_TIMEOUT_SECONDS
-                              Reaction approval/model-picker timeout (default: 300)
+    MATRIX_MODEL_PICKER_TIMEOUT_SECONDS
+                              Reaction model-picker timeout (default: 300). The
+                              legacy MATRIX_APPROVAL_TIMEOUT_SECONDS name is
+                              accepted as a fallback. Exec approvals do not expire.
 """
 
 from __future__ import annotations
@@ -948,11 +950,14 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_APPROVAL_REQUIRE_SENDER", "true"
         ).lower() in ("true", "1", "yes")
         try:
-            self._approval_timeout_seconds = int(
-                os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
+            self._model_picker_timeout_seconds = int(
+                os.getenv(
+                    "MATRIX_MODEL_PICKER_TIMEOUT_SECONDS",
+                    os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300"),
+                )
             )
         except ValueError:
-            self._approval_timeout_seconds = 300
+            self._model_picker_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
         self._allowed_user_ids: Set[str] = {
@@ -2027,7 +2032,7 @@ class MatrixAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             message_id=result.message_id,
             requester_user_id=requester_user_id,
-            expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
+            expires_at=None,
         )
         old_event = self._approval_prompt_by_session.get(session_key)
         if old_event:
@@ -2113,7 +2118,7 @@ class MatrixAdapter(BasePlatformAdapter):
             choices=choices,
             on_model_selected=on_model_selected,
             requester_user_id=str((metadata or {}).get("requester_user_id") or "") or None,
-            expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
+            expires_at=time.monotonic() + max(self._model_picker_timeout_seconds, 0),
         )
         self._model_picker_prompts_by_event[result.message_id] = prompt
 

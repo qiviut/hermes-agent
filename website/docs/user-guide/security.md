@@ -31,7 +31,6 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 ```yaml
 approvals:
   mode: smart                     # smart | manual | off
-  timeout: 60                     # seconds to wait for user response (default: 60)
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
@@ -42,7 +41,6 @@ The full set of keys:
 | Key | Default | What it controls |
 |---|---|---|
 | `mode` | `smart` | Approval policy for dangerous shell commands — see the table below. |
-| `timeout` | `60` | Seconds Hermes waits for an approval reply before timing out. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
@@ -136,16 +134,29 @@ Like the rest of the approval config, changes take effect immediately (the confi
 Deny rules are a guardrail against an honest-but-wrong agent, the same threat model as the dangerous-pattern detector. They are not a sandbox against a deliberately adversarial process — for that, use an isolated backend (Docker, Modal) or an egress-restricted environment.
 :::
 
-### Approval Timeout
+### Pending Approvals
 
-When a dangerous command prompt appears, the user has a configurable amount of time to respond. If no response is given within the timeout, the command is **denied** by default (fail-closed).
+Approval requests do not expire. This applies to CLI and gateway command
+approvals, ACP permission requests, MCP elicitation consent, and messaging
+surfaces such as Matrix, Discord, and QQ. A request remains pending until the
+user approves it, denies it, or explicitly interrupts/stops the session. Silence
+is never treated as consent or as an implicit denial. Interruption is reported
+as a distinct fail-closed outcome rather than rewritten as a user denial; ACP
+futures and MCP synchronous consent workers are cancelled/released with it.
 
-Configure the timeout in `~/.hermes/config.yaml`:
+Gateway sessions send activity heartbeats while waiting so an otherwise healthy
+background run is not killed as idle. MCP transport deadlines exclude time spent
+waiting for elicitation consent, then resume after the decision; ordinary
+network timeouts still apply. A messaging platform may eventually disable stale
+buttons because its interaction token expired, but that UI event does not decide
+the approval—the platform's text approval/deny command remains available. An
+explicit session stop or process restart still interrupts the run; clients
+should surface that state and use their normal recovery path.
 
-```yaml
-approvals:
-  timeout: 60  # seconds (default: 60)
-```
+The Runs approval endpoint also accepts `safer_alternative`. This is not an
+approval: the requested mechanism stays blocked, no reusable permission is
+created, and the tool result permits only a safer native, purpose-built, or
+managed approach within the authority already granted for the original task.
 
 ### What Triggers Approval
 

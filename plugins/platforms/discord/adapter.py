@@ -6826,7 +6826,9 @@ def _define_discord_view_classes() -> None:
         Shows four buttons: Allow Once, Allow Session, Always Allow, Deny.
         Clicking a button calls ``resolve_gateway_approval()`` to unblock the
         waiting agent thread — the same mechanism as the text ``/approve`` flow.
-        Only users in the allowed list can click.  Times out after 5 minutes.
+        Only users in the allowed list can click. Discord eventually expires
+        the buttons, but that does not decide the approval; text commands stay
+        available while the operation remains pending.
         """
 
         def __init__(
@@ -6950,18 +6952,21 @@ def _define_discord_view_classes() -> None:
             await self._resolve(interaction, "deny", discord.Color.red(), "Denied")
 
         async def on_timeout(self):
-            """Handle view timeout -- disable buttons and mark as expired."""
+            """Expire buttons without deciding the still-pending approval."""
             self.resolved = True
             for child in self.children:
                 child.disabled = True
-            # Visually update the Discord message so buttons appear disabled.
+            # The durable decision path remains available through /approve and
+            # /deny after Discord's component interaction token expires.
             msg = getattr(self, '_message', None)
             if msg:
                 try:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(
+                            text="Buttons expired — approval still pending; use /approve or /deny"
+                        )
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass  # message deleted or too old to edit

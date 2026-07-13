@@ -112,11 +112,22 @@ class TestCliApprovalUi:
             time.sleep(0.01)
 
         assert cli._approval_state is not None
+        assert cli._approval_deadline == 0
         assert "view" in cli._approval_state["choices"]
+        time.sleep(0.1)
+        assert thread.is_alive(), "approval callback expired without a decision"
 
         cli._approval_state["response_queue"].put("deny")
         thread.join(timeout=2)
         assert result["value"] == "deny"
+
+    def test_approval_callback_preserves_interrupt_as_distinct_outcome(self):
+        cli = _make_cli_stub()
+        with patch("tools.interrupt.is_interrupted", return_value=True):
+            result = cli._approval_callback("sudo true", "privileged command")
+        assert result == "interrupted"
+        assert cli._approval_state is None
+        assert cli._approval_deadline == 0
 
     def test_handle_approval_selection_view_expands_in_place(self):
         cli = _make_cli_stub()

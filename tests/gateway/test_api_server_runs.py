@@ -358,6 +358,27 @@ class TestRunEvents:
         )
 
     @pytest.mark.asyncio
+    async def test_approval_accepts_typed_safer_alternative(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_safer_alternative"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        adapter._run_approval_sessions[run_id] = "session-safer"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "safer_alternative"},
+                )
+
+        assert response.status == 200
+        mock_resolve.assert_called_once_with(
+            "session-safer",
+            "safer_alternative",
+            resolve_all=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)

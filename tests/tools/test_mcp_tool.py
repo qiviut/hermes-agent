@@ -637,6 +637,25 @@ class TestCheckFunction:
 # ---------------------------------------------------------------------------
 
 class TestRunOnMcpLoop:
+    def test_elicitation_wait_is_excluded_from_transport_timeout(self):
+        import tools.mcp_tool as mcp_loop
+
+        mcp_loop._ensure_mcp_loop()
+        pause = threading.Event()
+        pause.set()
+
+        async def _slow_consent_path():
+            await asyncio.sleep(0.15)
+            return "accepted"
+
+        try:
+            assert mcp_loop._run_on_mcp_loop(
+                _slow_consent_path(), timeout=0.03, deadline_pause=pause
+            ) == "accepted"
+        finally:
+            pause.clear()
+            mcp_loop._stop_mcp_loop()
+
     def test_scheduler_failure_closes_factory_coroutine(self):
         """If run_coroutine_threadsafe raises, the factory's coroutine is closed."""
         import gc
@@ -712,7 +731,7 @@ class TestToolHandler:
 
     def _patch_mcp_loop(self, coro_side_effect=None):
         """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
-        def fake_run(coro_or_factory, timeout=30):
+        def fake_run(coro_or_factory, timeout=30, **_kwargs):
             coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
             return asyncio.run(coro)
         if coro_side_effect:
@@ -792,7 +811,7 @@ class TestToolHandler:
 
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
-            def _interrupting_run(coro_or_factory, timeout=30):
+            def _interrupting_run(coro_or_factory, timeout=30, **_kwargs):
                 coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
                 coro.close()
                 raise InterruptedError("User sent a new message")
@@ -2251,7 +2270,7 @@ class TestConfigurableTimeouts:
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
             with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
-                def fake_run(coro, timeout=30):
+                def fake_run(coro, timeout=30, **_kwargs):
                     coro.close()
                     return json.dumps({"result": "ok"})
 
@@ -2354,7 +2373,7 @@ class TestUtilityHandlers:
 
     def _patch_mcp_loop(self):
         """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
-        def fake_run(coro_or_factory, timeout=30):
+        def fake_run(coro_or_factory, timeout=30, **_kwargs):
             coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
             return asyncio.run(coro)
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)

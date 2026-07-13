@@ -8,7 +8,7 @@ Covers the canonical fix for issues #4146, #27303, #30882, #33057:
   2. Both execute_code RPC threads are wrapped with that helper (source guard).
   3. tools.approval.check_execute_code_guard — the entry-point guard decision
      matrix (isolated backends, yolo/off, cron-deny, headless-local,
-     gateway approve/deny/timeout/missing-notify, smart mode).
+     gateway approve/deny/pending/missing-notify, smart mode).
   4. tools.code_execution_tool._scrub_child_env — broad HERMES_ prefix dropped,
      operational allowlist kept, DSN/WEBHOOK blocked, passthrough precedence.
 """
@@ -233,24 +233,35 @@ def test_guard_gateway_user_denies_blocks(gw_session):
     assert res["user_consent"] is False
 
 
-@pytest.mark.parametrize(
-    "approval_config",
-    [
-        {"timeout": 0},
-        {"timeout": 0, "gateway_timeout": 300},
-    ],
-    ids=["shared-timeout-only", "shared-timeout-is-canonical"],
-)
-def test_guard_gateway_wait_uses_canonical_timeout(
-    gw_session, monkeypatch, approval_config
-):
-    # Register a callback that never resolves; force an immediate timeout.
+def test_guard_gateway_legacy_timeout_stays_pending(gw_session, monkeypatch):
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(A, "is_approved", lambda *_args, **_kwargs: False)
+    notified = threading.Event()
     with A._lock:
-        A._gateway_notify_cbs[gw_session] = lambda _d: None
-    monkeypatch.setattr(A, "_get_approval_config", lambda: approval_config)
-    res = A.check_execute_code_guard("import os", "local")
+        A._gateway_notify_cbs[gw_session] = lambda _d: notified.set()
+    monkeypatch.setattr(A, "_get_approval_config", lambda: {"gateway_timeout": 0})
+    holder = {}
+
+    def worker():
+        token = A.set_current_session_key(gw_session)
+        try:
+            holder["result"] = A.check_execute_code_guard("import os", "local")
+        finally:
+            A.reset_current_session_key(token)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert notified.wait(timeout=2)
+    thread.join(timeout=0.1)
+    assert thread.is_alive()
+    assert "result" not in holder
+
+    A.resolve_gateway_approval(gw_session, "deny")
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    res = holder["result"]
     assert res["approved"] is False
-    assert res["outcome"] == "timeout"
+    assert res["outcome"] == "denied"
 
 
 def test_guard_gateway_missing_notify_is_pending(gw_session):

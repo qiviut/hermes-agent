@@ -2688,13 +2688,11 @@ class QQAdapter(BasePlatformAdapter):
             title="Execute this command?",
             description=description,
             command_preview=command,
-            timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
         )
         return await self.send_approval_request(
             chat_id, req, reply_to=msg_id,
         )
 
-    _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
 
     async def send_update_prompt(
             self,

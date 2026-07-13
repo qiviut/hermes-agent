@@ -1612,9 +1612,9 @@ def clear_session(session_key: str) -> None:
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
-        # Session-boundary cleanup should cancel any blocked approval waits
-        # immediately so the old run can unwind instead of idling until timeout.
-        entry.result = "deny"
+        # Session-boundary cleanup cancels blocked waits without fabricating a
+        # user denial. The old run unwinds immediately and preserves the reason.
+        entry.result = "interrupted"
         entry.event.set()
 
 
@@ -1733,9 +1733,9 @@ def save_permanent_allowlist(patterns: set):
 # =========================================================================
 
 def prompt_dangerous_approval(command: str, description: str,
-                              timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
-                              approval_callback=None) -> str:
+                              approval_callback=None,
+                              cancel_event: threading.Event | None = None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
@@ -1745,11 +1745,11 @@ def prompt_dangerous_approval(command: str, description: str,
         approval_callback: Optional callback registered by the CLI for
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True) -> str.
+        cancel_event: Optional caller-owned cancellation signal. It interrupts
+            the wait without recording an approval or denial decision.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', or 'interrupted'.
     """
-    if timeout_seconds is None:
-        timeout_seconds = _get_approval_timeout()
 
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
@@ -1822,11 +1822,10 @@ def prompt_dangerous_approval(command: str, description: str,
 
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
-            thread.join(timeout=timeout_seconds)
-
-            if thread.is_alive():
-                print("\n" + t("approval.timeout"))
-                return "deny"
+            while thread.is_alive():
+                thread.join(timeout=0.25)
+                if cancel_event is not None and cancel_event.is_set():
+                    return "interrupted"
 
             choice = result["choice"]
             if choice in {'o', 'once'}:
@@ -1886,7 +1885,7 @@ def _normalize_approval_mode(mode) -> str:
 
 
 def _get_approval_config() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    """Load approval configuration (mode, scoped policy, etc.)."""
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -1897,7 +1896,7 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the approval mode from config."""
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 
@@ -1921,14 +1920,6 @@ def is_approval_bypass_active() -> bool:
         or is_current_session_yolo_enabled()
         or _get_approval_mode() == "off"
     )
-
-
-def _get_approval_timeout() -> int:
-    """Read the approval timeout from config. Defaults to 60 seconds."""
-    try:
-        return int(_get_approval_config().get("timeout", 60))
-    except (ValueError, TypeError):
-        return 60
 
 
 def _get_cron_approval_mode() -> str:
@@ -2207,14 +2198,43 @@ def _run_approval_gate(
                     "pattern_key": pattern_key,
                     "description": description,
                 }
+            if decision.get("interrupted"):
+                return {
+                    "approved": False,
+                    "message": (
+                        "INTERRUPTED: The approval wait ended because the session "
+                        "was interrupted. No user decision or consent was recorded."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "interrupted",
+                    "user_consent": False,
+                }
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
 
+            if resolved and choice == "safer_alternative":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: The user did not consent to this action mechanism "
+                        "and requested a safer alternative. Do NOT retry or rephrase "
+                        "this mechanism and do not broaden authority. You may continue "
+                        "the original goal only through a safer native, purpose-built, "
+                        "or managed path within existing authorization; otherwise "
+                        "explain the blocker."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "safer_alternative",
+                    "user_consent": False,
+                }
+
             if not resolved or choice is None or choice == "deny":
                 if not resolved:
-                    reason = "timed out without user response"
-                    timeout_addendum = " Silence is not consent."
+                    reason = "ended without a user decision"
+                    timeout_addendum = " Silence was not treated as consent."
                 else:
                     reason = "denied by user"
                     timeout_addendum = ""
@@ -2264,6 +2284,18 @@ def _run_approval_gate(
     choice = prompt_dangerous_approval(display_target, description,
                                        approval_callback=approval_callback)
 
+    if choice == "interrupted":
+        return {
+            "approved": False,
+            "message": (
+                "INTERRUPTED: The approval wait ended because the session was "
+                "interrupted. No user decision or consent was recorded."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "interrupted",
+            "user_consent": False,
+        }
     if choice == "deny":
         return {
             "approved": False,
@@ -2489,10 +2521,11 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            cancel_event: threading.Event | None = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
-    thread until the request is resolved or the gateway approval timeout
-    elapses — firing pre/post approval hooks and cleaning up the queue entry.
+    thread until the request is resolved or the session is interrupted —
+    firing pre/post approval hooks and cleaning up the queue entry.
 
     Shared by the terminal command guard (``check_all_command_guards``) and
     the execute_code guard (``check_execute_code_guard``) so the fiddly
@@ -2540,12 +2573,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         _drop_entry()
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or the canonical approval timeout elapses
-    # (default 60s). Poll in short slices so we can fire activity heartbeats
-    # every ~10s to the agent's inactivity tracker — otherwise the gateway
-    # watchdog kills the agent while the user is still responding. Mirrors
-    # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    # Block until the user responds or interrupts the session. Poll in short
+    # slices so we can fire activity heartbeats every ~10s to the agent's
+    # inactivity tracker — otherwise the gateway watchdog kills the agent
+    # while the user is still responding. Mirrors _wait_for_process() cadence.
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -2553,31 +2584,28 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
+    interrupted = False
     while True:
         # Respect interrupt signals (e.g. /stop, /new, or an inactivity
         # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
+        # session wedged on threading.Event.wait(). The wait runs on the
+        # agent's execution thread, which is the
         # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
-        if is_interrupted():
+        # sees the signal. Preserve interruption as a distinct fail-closed
+        # outcome rather than rewriting it as a user denial (#8697).
+        if (cancel_event is not None and cancel_event.is_set()) or is_interrupted():
             logger.info(
                 "Approval wait interrupted by user signal — "
-                "returning deny for session %s",
+                "returning interrupted for session %s",
                 session_key,
             )
-            entry.result = "deny"
+            entry.result = None
             entry.event.set()
-            resolved = True
+            interrupted = True
             break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
+        if entry.event.wait(timeout=1.0):
             resolved = True
             break
         if touch_activity_if_due is not None:
@@ -2586,10 +2614,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _drop_entry()
 
     choice = entry.result
-    # Normalize outcome for the post hook. Unresolved (timeout) and None both
-    # mean the user never responded; report that explicitly so plugins can
-    # distinguish timeout from explicit deny.
-    _outcome = "timeout" if not resolved else (choice if choice else "timeout")
+    if choice == "interrupted":
+        # clear_session()/process teardown releases the waiter by setting a
+        # typed cancellation result. Preserve that distinction instead of
+        # treating an unknown non-empty choice as approval.
+        interrupted = True
+        resolved = False
+        choice = None
+    _outcome = "interrupted" if interrupted else (choice if resolved and choice else "unresolved")
     _fire_approval_hook(
         "post_approval_response",
         command=command,
@@ -2600,7 +2632,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    decision = {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    if interrupted:
+        decision["interrupted"] = True
+    return decision
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -2889,9 +2924,38 @@ def check_all_command_guards(command: str, env_type: str,
                     "pattern_key": primary_key,
                     "description": combined_desc,
                 }
+            if decision.get("interrupted"):
+                return {
+                    "approved": False,
+                    "message": (
+                        "INTERRUPTED: The command approval wait ended because the "
+                        "session was interrupted. No user decision or consent was recorded."
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "interrupted",
+                    "user_consent": False,
+                }
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
+
+            if resolved and choice == "safer_alternative":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: The user did not consent to this command mechanism "
+                        "and requested a safer alternative. Do NOT retry or rephrase "
+                        "this mechanism and do not broaden authority. You may continue "
+                        "the original goal only with a safer native, purpose-built, or "
+                        "managed method that stays within existing authorization; "
+                        "otherwise explain the blocker."
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "safer_alternative",
+                    "user_consent": False,
+                }
 
             if not resolved or choice is None or choice == "deny":
                 # Consent contract: silence is NOT consent, and an explicit
@@ -2900,9 +2964,9 @@ def check_all_command_guards(command: str, env_type: str,
                 # rephrase, achieve the same outcome via a different command).
                 # See issue #24912 for the original incident.
                 if not resolved:
-                    reason = "timed out without user response"
+                    reason = "ended without a user decision"
                     timeout_addendum = " Silence is not consent."
-                    outcome = "timeout"
+                    outcome = "unresolved"
                 else:
                     reason = "denied by user"
                     timeout_addendum = ""
@@ -2995,6 +3059,18 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
+    if choice == "interrupted":
+        return {
+            "approved": False,
+            "message": (
+                "INTERRUPTED: The command approval wait ended because the session "
+                "was interrupted. No user decision or consent was recorded."
+            ),
+            "pattern_key": primary_key,
+            "description": combined_desc,
+            "outcome": "interrupted",
+            "user_consent": False,
+        }
     if choice == "deny":
         return {
             "approved": False,
@@ -3197,14 +3273,42 @@ def check_execute_code_guard(code: str, env_type: str,
             "outcome": "notify_failed",
             "user_consent": False,
         }
+    if decision.get("interrupted"):
+        return {
+            "approved": False,
+            "message": (
+                "INTERRUPTED: The execute_code approval wait ended because the "
+                "session was interrupted. No user decision or consent was recorded."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "interrupted",
+            "user_consent": False,
+        }
 
     resolved = decision["resolved"]
     choice = decision["choice"]
     deny_reason = decision.get("reason")
 
+    if resolved and choice == "safer_alternative":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: The user did not consent to running this execute_code "
+                "script and requested a safer alternative. Do NOT retry or rephrase "
+                "the script and do not broaden authority. You may continue the "
+                "original goal only with safer native, purpose-built, or managed "
+                "tools within existing authorization; otherwise explain the blocker."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "safer_alternative",
+            "user_consent": False,
+        }
+
     if not resolved or choice is None or choice == "deny":
-        reason = "timed out without user response" if not resolved else "denied by user"
-        addendum = " Silence is not consent." if not resolved else ""
+        reason = "ended without a user decision" if not resolved else "denied by user"
+        addendum = " Silence was not treated as consent." if not resolved else ""
         reason_addendum = ""
         if resolved and choice == "deny" and deny_reason:
             reason_addendum = f' Reason given by the user: "{deny_reason}".'
@@ -3218,7 +3322,7 @@ def check_execute_code_guard(code: str, env_type: str,
             ),
             "pattern_key": pattern_key,
             "description": description,
-            "outcome": "timeout" if not resolved else "denied",
+            "outcome": "unresolved" if not resolved else "denied",
             "user_consent": False,
             "deny_reason": deny_reason,
         }
@@ -3244,8 +3348,8 @@ def request_elicitation_consent(
     message: str,
     description: str,
     *,
-    timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -3255,8 +3359,8 @@ def request_elicitation_consent(
     agent thread blocks until the user responds via the platform UI.
     CLI/TUI sessions go through ``prompt_dangerous_approval``.
 
-    Always fails closed: missing notify_cb in a gateway session, timeouts,
-    and exceptions all map to ``"decline"`` so a server treats them as
+    Always fails closed: a missing notify callback or exception maps to
+    ``"decline"`` so a server treats it as
     "user did not approve" rather than retrying or hanging.
 
     Returns one of ``"accept" | "decline" | "cancel"``.
@@ -3287,6 +3391,7 @@ def request_elicitation_consent(
         try:
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface=surface,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             logger.error(
@@ -3309,8 +3414,8 @@ def request_elicitation_consent(
         choice = prompt_dangerous_approval(
             message,
             description,
-            timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            cancel_event=cancel_event,
         )
     except Exception as exc:
         logger.error(
@@ -3320,6 +3425,8 @@ def request_elicitation_consent(
 
     if choice in ("once", "session", "always"):
         return "accept"
+    if choice == "interrupted":
+        return "cancel"
     return "decline"
 
 

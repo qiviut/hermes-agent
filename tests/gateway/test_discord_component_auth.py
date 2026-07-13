@@ -463,3 +463,17 @@ def test_other_views_not_admin_gated():
     )
     assert sc._check_auth(_interaction(11111)) is True
 
+
+@pytest.mark.asyncio
+async def test_exec_approval_button_timeout_does_not_decide_consent():
+    """Discord component expiry disables stale UI without denying approval."""
+    from unittest.mock import patch
+
+    view = ExecApprovalView(session_key="s", allowed_user_ids={"11111"})
+    with patch("tools.approval.resolve_gateway_approval") as resolve:
+        await view.on_timeout()
+
+    resolve.assert_not_called()
+    assert view.resolved is True
+    assert all(getattr(child, "disabled", False) for child in view.children)
+

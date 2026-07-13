@@ -11694,13 +11694,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         expanded before deciding.
 
         Uses _approval_lock to serialize concurrent requests (e.g. from
-        parallel delegation subtasks) so each prompt gets its own turn
-        and the shared _approval_state / _approval_deadline aren't clobbered.
+        parallel delegation subtasks) so each prompt gets its own turn.
         """
-        import time as _time
-
         with self._approval_lock:
-            timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 60))
             response_queue = queue.Queue()
 
             self._approval_state = {
@@ -11710,47 +11706,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 "selected": 0,
                 "response_queue": response_queue,
             }
-            self._approval_deadline = _time.monotonic() + timeout
+            self._approval_deadline = 0
 
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
             # window collision or in-flight resize), leaving the panel unseen so
-            # the command is denied on timeout without the user ever seeing it
-            # (#41098). The countdown refreshes below paint the same way.
+            # the command can remain pending without the user ever seeing it
+            # (#41098).
             self._paint_now()
-
-            _last_countdown_refresh = _time.monotonic()
+            from tools.interrupt import is_interrupted
             while True:
                 try:
-                    result = response_queue.get(timeout=1)
-                    self._approval_state = None
-                    self._approval_deadline = 0
-                    self._paint_now()
-                    _outcome_labels = {
-                        "once": "allowed once",
-                        "session": "allowed for session",
-                        "always": "added to allowlist",
-                        "deny": "denied",
-                    }
-                    self._persist_prompt_summary(
-                        "⚠", "Approval", command,
-                        _outcome_labels.get(result, str(result)),
-                    )
-                    return result
+                    result = response_queue.get(timeout=0.25)
+                    break
                 except queue.Empty:
-                    remaining = self._approval_deadline - _time.monotonic()
-                    if remaining <= 0:
+                    if is_interrupted():
+                        result = "interrupted"
                         break
-                    now = _time.monotonic()
-                    if now - _last_countdown_refresh >= 1.0:
-                        _last_countdown_refresh = now
-                        self._paint_now()
-
             self._approval_state = None
             self._approval_deadline = 0
             self._paint_now()
-            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-            return "deny"
+            _outcome_labels = {
+                "once": "allowed once",
+                "session": "allowed for session",
+                "always": "added to allowlist",
+                "deny": "denied",
+                "interrupted": "interrupted without a decision",
+            }
+            self._persist_prompt_summary(
+                "⚠", "Approval", command,
+                _outcome_labels.get(result, str(result)),
+            )
+            return result
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
@@ -14416,10 +14403,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 ]
 
             if cli_ref._approval_state:
-                remaining = max(0, int(cli_ref._approval_deadline - time.monotonic()))
                 return [
                     ('class:hint', '  ↑/↓ to select, Enter to confirm'),
-                    ('class:clarify-countdown', f'  ({remaining}s)'),
+                    ('class:clarify-countdown', '  (waiting for decision)'),
                 ]
 
             if cli_ref._slash_confirm_state:

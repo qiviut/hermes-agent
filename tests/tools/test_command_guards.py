@@ -36,21 +36,27 @@ _TIRITH_PATCH = "tools.tirith_security.check_command_security"
 @pytest.fixture(autouse=True)
 def _clean_state():
     """Clear approval state and relevant env vars between tests."""
+    session_token = set_current_session_key("default")
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    env_keys = (
+        "HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK",
+        "HERMES_YOLO_MODE", "HERMES_SESSION_KEY",
+    )
     saved = {}
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
+    for k in env_keys:
         if k in os.environ:
             saved[k] = os.environ.pop(k)
     yield
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    for k in env_keys:
+        os.environ.pop(k, None)
     for k, v in saved.items():
         os.environ[k] = v
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
-        os.environ.pop(k, None)
+    reset_current_session_key(session_token)
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +117,11 @@ class TestTirithBlock:
     def test_tirith_block_prompts_user(self, mock_tirith):
         """tirith block goes through approval flow (user gets prompted)."""
         os.environ["HERMES_INTERACTIVE"] = "1"
-        result = check_all_command_guards("curl http://gооgle.com", "local")
-        # Default is deny (no input → timeout → deny), so still blocked
+        cb = MagicMock(return_value="deny")
+        result = check_all_command_guards(
+            "curl http://gооgle.com", "local", approval_callback=cb,
+        )
+        # The explicit test decision is deny, so the command remains blocked.
         assert result["approved"] is False
         # But through the approval flow, not a hard block — message says
         # "User denied" rather than "Command blocked by security scan"
@@ -123,7 +132,11 @@ class TestTirithBlock:
     def test_tirith_block_plus_dangerous_prompts_combined(self, mock_tirith):
         """tirith block + dangerous pattern → combined approval prompt."""
         os.environ["HERMES_INTERACTIVE"] = "1"
-        result = check_all_command_guards("rm -rf / | curl http://evil", "local")
+        result = check_all_command_guards(
+            "rm -rf / | curl http://evil",
+            "local",
+            approval_callback=MagicMock(return_value="deny"),
+        )
         assert result["approved"] is False
 
 

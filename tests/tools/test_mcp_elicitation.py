@@ -9,6 +9,8 @@ optional dependency under the `[mcp]` extra).
 """
 
 import asyncio
+import threading
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -97,10 +99,7 @@ class TestElicitationHandlerFormMode:
         assert handler.metrics["accepted"] == 0
 
     def test_cancel_propagates_through(self):
-        """request_elicitation_consent returns 'cancel' when the gateway
-        wait times out (resolved=False). The handler should propagate
-        that as ElicitResult(action='cancel') so the server can
-        distinguish 'no answer' from 'no'."""
+        """An interrupted consent wait propagates as MCP cancel."""
         handler = ElicitationHandler("pay", {"timeout": 5})
         params = _form_params()
 
@@ -140,29 +139,43 @@ class TestElicitationHandlerFailureModes:
         assert result.action == "decline"
         assert handler.metrics["errors"] == 1
 
-    def test_timeout_returns_cancel(self, monkeypatch):
-        # Shrink the outer grace window so the test budget is just the
-        # handler timeout. Default grace is 5s, which makes stall durations
-        # tight and the test flaky.
-        monkeypatch.setattr(
-            ElicitationHandler, "_OUTER_TIMEOUT_GRACE_SECONDS", 0
-        )
-        # _safe_numeric clamps `timeout` to a minimum of 1s, so the
-        # effective wait_for budget is 1s here. Stall longer than that
-        # so the wait_for reliably fires TimeoutError.
+    def test_legacy_timeout_config_does_not_cancel_consent(self):
         handler = ElicitationHandler("pay", {"timeout": 0.05})
         params = _form_params()
 
         def stall(*_args, **_kwargs):
             import time as _t
-            _t.sleep(2)
+            _t.sleep(0.2)
             return "accept"
 
         with patch("tools.approval.request_elicitation_consent", side_effect=stall):
             result = asyncio.run(handler(context=None, params=params))
 
-        assert result.action == "cancel"
-        assert handler.metrics["errors"] == 1
+        assert result.action == "accept"
+        assert handler.metrics["errors"] == 0
+
+    def test_cancelled_mcp_call_releases_sync_consent_waiter(self):
+        handler = ElicitationHandler("pay", {})
+        entered = threading.Event()
+        exited = threading.Event()
+
+        def consent(*_args, cancel_event=None, **_kwargs):
+            assert cancel_event is not None
+            entered.set()
+            assert cancel_event.wait(timeout=2)
+            exited.set()
+            return "cancel"
+
+        async def scenario():
+            with patch("tools.approval.request_elicitation_consent", side_effect=consent):
+                task = asyncio.create_task(handler(context=None, params=_form_params()))
+                assert await asyncio.to_thread(entered.wait, 1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert await asyncio.to_thread(exited.wait, 2)
+
+        asyncio.run(scenario())
 
 
 class TestElicitationHandlerWiring:
@@ -171,9 +184,28 @@ class TestElicitationHandlerWiring:
         kwargs = handler.session_kwargs()
         assert kwargs == {"elicitation_callback": handler}
 
-    def test_default_timeout_is_300_seconds(self):
+    def test_no_decision_timeout_is_configured(self):
         handler = ElicitationHandler("pay", {})
-        assert handler.timeout == 300
+        assert not hasattr(handler, "timeout")
+
+    def test_owner_signals_pending_human_wait(self):
+        from types import SimpleNamespace
+
+        pending = threading.Event()
+        owner = SimpleNamespace(_pending_call_context=None, _elicitation_pending=pending)
+        handler = ElicitationHandler("pay", {}, owner=cast(Any, owner))
+        observed = []
+
+        def consent(*_args, **_kwargs):
+            observed.append(pending.is_set())
+            return "accept"
+
+        with patch("tools.approval.request_elicitation_consent", side_effect=consent):
+            result = asyncio.run(handler(context=None, params=_form_params()))
+
+        assert result.action == "accept"
+        assert observed == [True]
+        assert not pending.is_set()
 
     def test_disabled_config_does_not_construct_handler(self):
         """The server task initializer checks ``elicitation.enabled`` --
@@ -181,9 +213,8 @@ class TestElicitationHandlerWiring:
         of that decision lives in MCPServerTask, but the handler itself
         must remain harmless to instantiate with arbitrary config."""
         handler = ElicitationHandler("pay", {"enabled": False, "timeout": 10})
-        # Just confirm it instantiates and reads timeout; the gate lives
-        # at the higher layer.
-        assert handler.timeout == 10
+        # Just confirm it instantiates; the gate lives at the higher layer.
+        assert not hasattr(handler, "timeout")
 
 
 class TestElicitationHandlerContextBridge:

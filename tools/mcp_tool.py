@@ -1358,23 +1358,14 @@ class ElicitationHandler:
     the prompt on whichever surface the active session uses -- CLI, TUI,
     Telegram, Slack, etc. URL-mode elicitations are declined as unsupported.
 
-    Failure modes are fail-closed: any timeout, exception, or unexpected
-    state returns ``decline``/``cancel`` rather than silently accepting.
+    Failure modes are fail-closed: any exception or unexpected state returns
+    ``decline``/``cancel`` rather than silently accepting. Silence leaves the
+    request pending.
     The server treats this as the user not approving.
     """
 
-    # Outer cap for the approval await. ``prompt_dangerous_approval`` runs
-    # its own input() timeout via the approval-config value; this is an
-    # asyncio-side safety net so the MCP event loop never blocks
-    # indefinitely if the inner timeout machinery is bypassed.
-    _OUTER_TIMEOUT_GRACE_SECONDS = 5
-
     def __init__(self, server_name: str, config: dict, owner: Optional["MCPServerTask"] = None):
         self.server_name = server_name
-        # Per-elicitation timeout. Default 5 min mirrors the gateway approval
-        # default so users on async surfaces (Telegram, Slack) have time to
-        # respond before the server gives up.
-        self.timeout = _safe_numeric(config.get("timeout", 300), 300, float)
         # Back-reference to the MCPServerTask so we can read the agent's
         # captured contextvars snapshot at elicitation time. Optional so
         # the handler stays unit-testable in isolation.
@@ -1452,14 +1443,15 @@ class ElicitationHandler:
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
         captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        consent_cancel = threading.Event()
 
         def _invoke_consent() -> str:
             if captured is None:
                 return request_elicitation_consent(
                     message,
                     description,
-                    timeout_seconds=int(self.timeout),
                     surface=f"mcp-elicitation/{self.server_name}",
+                    cancel_event=consent_cancel,
                 )
             # Context.run can only execute a context once — copy to allow
             # multiple elicitations within a single tool call.
@@ -1467,22 +1459,21 @@ class ElicitationHandler:
                 request_elicitation_consent,
                 message,
                 description,
-                timeout_seconds=int(self.timeout),
                 surface=f"mcp-elicitation/{self.server_name}",
+                cancel_event=consent_cancel,
             )
 
+        pending_signal = getattr(self.owner, "_elicitation_pending", None) if self.owner is not None else None
+        if pending_signal is not None:
+            pending_signal.set()
         try:
-            answer = await asyncio.wait_for(
-                asyncio.to_thread(_invoke_consent),
-                timeout=self.timeout + self._OUTER_TIMEOUT_GRACE_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s' elicitation timed out after %ds",
-                self.server_name, int(self.timeout),
-            )
-            self.metrics["errors"] += 1
-            return ElicitResult(action="cancel")
+            answer = await asyncio.to_thread(_invoke_consent)
+        except asyncio.CancelledError:
+            # asyncio cannot kill the worker created by to_thread(). Signal the
+            # synchronous approval waiter so it drops its queue entry and exits
+            # instead of leaking after the MCP call/session is cancelled.
+            consent_cancel.set()
+            raise
         except Exception as exc:
             logger.error(
                 "MCP server '%s' elicitation failed: %s",
@@ -1490,6 +1481,9 @@ class ElicitationHandler:
             )
             self.metrics["errors"] += 1
             return ElicitResult(action="decline")
+        finally:
+            if pending_signal is not None:
+                pending_signal.clear()
 
         if answer == "accept":
             self.metrics["accepted"] += 1
@@ -1522,7 +1516,7 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context",
+        "_pending_call_context", "_elicitation_pending",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1569,6 +1563,10 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # Thread-safe signal used by the synchronous tool-call waiter to pause
+        # its transport deadline while a human approval is pending. Network
+        # timeouts still apply before and after the decision.
+        self._elicitation_pending = threading.Event()
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -3611,7 +3609,12 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
-def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
+def _run_on_mcp_loop(
+    coro_or_factory,
+    timeout: float | None = 30,
+    *,
+    deadline_pause: threading.Event | None = None,
+):
     """Schedule a coroutine on the MCP event loop and block until done.
 
     Accepts either a coroutine object or a zero-arg callable that returns one.
@@ -3621,6 +3624,8 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
 
     Poll in short intervals so the calling agent thread can honor user
     interrupts while the MCP work is still running on the background loop.
+    When ``deadline_pause`` is set, time spent waiting for explicit human
+    elicitation consent is excluded from the transport deadline.
     """
     from tools.interrupt import is_interrupted
     from agent.async_utils import safe_schedule_threadsafe
@@ -3655,18 +3660,25 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
+    last_poll = start_time
 
     while True:
         if is_interrupted():
             future.cancel()
             raise InterruptedError("User sent a new message")
 
+        now = time.monotonic()
+        if deadline is not None and deadline_pause is not None and deadline_pause.is_set():
+            deadline += now - last_poll
+        last_poll = now
+
         wait_timeout = 0.1
         if deadline is not None:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 future.cancel()
                 elapsed = time.monotonic() - start_time
+                assert timeout is not None
                 raise TimeoutError(
                     f"MCP call timed out after {elapsed:.1f}s "
                     f"(configured timeout: {float(timeout):.1f}s)"
@@ -3991,7 +4003,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            return _run_on_mcp_loop(
+                _call,
+                timeout=tool_timeout,
+                deadline_pause=getattr(server, "_elicitation_pending", None),
+            )
 
         try:
             result = _call_once()
