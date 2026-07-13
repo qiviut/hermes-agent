@@ -824,6 +824,40 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_pre_signaled_call_cancellation_is_not_cleared_before_rpc(self):
+        """Cancellation racing RPC-lock acquisition must prevent the tool call."""
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("must not run", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        def _pre_signaled_run(coro_or_factory, timeout=30, **kwargs):
+            cancel = kwargs["cancellation_signal"]
+            cancel.set()
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+            assert asyncio.iscoroutine(coro)
+            try:
+                asyncio.run(coro)
+            except asyncio.CancelledError:
+                raise InterruptedError("User sent a new message")
+            raise AssertionError("pre-signaled cancellation was cleared")
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with patch(
+                "tools.mcp_tool._run_on_mcp_loop",
+                side_effect=_pre_signaled_run,
+            ):
+                result = json.loads(handler({}))
+            assert result == {"error": "MCP call interrupted: user sent a new message"}
+            mock_session.call_tool.assert_not_called()
+        finally:
+            _servers.pop("test_srv", None)
+
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
@@ -896,6 +930,49 @@ class TestRunOnMCPLoopInterrupts:
             while time.time() < deadline and not cancelled.is_set():
                 time.sleep(0.05)
             assert cancelled.is_set()
+        finally:
+            set_interrupt(False, waiter_tid)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+            loop.close()
+            mcp_mod._mcp_loop = old_loop
+            mcp_mod._mcp_thread = old_thread
+
+    def test_interrupt_signals_receive_loop_elicitation_waiter(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.interrupt import set_interrupt
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        pending = threading.Event()
+        pending.set()
+        consent_cancel = threading.Event()
+
+        async def _slow_call():
+            await asyncio.sleep(5)
+
+        old_loop = mcp_mod._mcp_loop
+        old_thread = mcp_mod._mcp_thread
+        mcp_mod._mcp_loop = loop
+        mcp_mod._mcp_thread = thread
+        waiter_tid = threading.current_thread().ident
+
+        def _interrupt_soon():
+            time.sleep(0.2)
+            set_interrupt(True, waiter_tid)
+
+        interrupter = threading.Thread(target=_interrupt_soon, daemon=True)
+        interrupter.start()
+        try:
+            with pytest.raises(InterruptedError, match="User sent a new message"):
+                mcp_mod._run_on_mcp_loop(
+                    _slow_call(),
+                    timeout=2,
+                    deadline_pause=pending,
+                    cancellation_signal=consent_cancel,
+                )
+            assert consent_cancel.is_set()
         finally:
             set_interrupt(False, waiter_tid)
             loop.call_soon_threadsafe(loop.stop)

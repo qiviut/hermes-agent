@@ -1506,6 +1506,19 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
+_APPROVAL_GRANT_CHOICES = frozenset({"once", "session", "always"})
+_APPROVAL_DECISION_CHOICES = _APPROVAL_GRANT_CHOICES | frozenset({
+    "deny", "interrupted", "safer_alternative",
+})
+
+
+def _normalize_approval_choice(choice: object) -> str:
+    """Return a known decision or fail closed for malformed callback values."""
+    if isinstance(choice, str) and choice in _APPROVAL_DECISION_CHOICES:
+        return choice
+    logger.warning("Invalid approval choice rejected: %r", choice)
+    return "deny"
+
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
@@ -1546,8 +1559,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    Returns the number of approvals resolved (0 means nothing was pending or
+    the supplied value was not an explicit supported decision).
     """
+    if not isinstance(choice, str) or choice not in _APPROVAL_DECISION_CHOICES:
+        logger.warning("Ignoring invalid gateway approval choice: %r", choice)
+        return 0
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
@@ -1761,8 +1779,13 @@ def prompt_dangerous_approval(command: str, description: str,
 
     if approval_callback is not None:
         try:
-            return approval_callback(display_command, display_description,
-                                     allow_permanent=allow_permanent)
+            return _normalize_approval_choice(
+                approval_callback(
+                    display_command,
+                    display_description,
+                    allow_permanent=allow_permanent,
+                )
+            )
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"
@@ -2231,7 +2254,7 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if not resolved or choice is None or choice == "deny":
+            if not resolved or choice not in _APPROVAL_GRANT_CHOICES:
                 if not resolved:
                     reason = "ended without a user decision"
                     timeout_addendum = " Silence was not treated as consent."
@@ -2296,7 +2319,7 @@ def _run_approval_gate(
             "outcome": "interrupted",
             "user_consent": False,
         }
-    if choice == "deny":
+    if choice not in _APPROVAL_GRANT_CHOICES:
         return {
             "approved": False,
             "message": (
@@ -2957,7 +2980,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
 
-            if not resolved or choice is None or choice == "deny":
+            if not resolved or choice not in _APPROVAL_GRANT_CHOICES:
                 # Consent contract: silence is NOT consent, and an explicit
                 # deny is also a hard halt — both produce a BLOCKED outcome
                 # that names the agent's most common evasion paths (retry,
@@ -3071,7 +3094,7 @@ def check_all_command_guards(command: str, env_type: str,
             "outcome": "interrupted",
             "user_consent": False,
         }
-    if choice == "deny":
+    if choice not in _APPROVAL_GRANT_CHOICES:
         return {
             "approved": False,
             "message": (
@@ -3306,7 +3329,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "user_consent": False,
         }
 
-    if not resolved or choice is None or choice == "deny":
+    if not resolved or choice not in _APPROVAL_GRANT_CHOICES:
         reason = "ended without a user decision" if not resolved else "denied by user"
         addendum = " Silence was not treated as consent." if not resolved else ""
         reason_addendum = ""

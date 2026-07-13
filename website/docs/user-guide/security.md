@@ -143,13 +143,20 @@ user approves it, denies it, or explicitly interrupts/stops the session. Silence
 is never treated as consent or as an implicit denial. Interruption is reported
 as a distinct fail-closed outcome rather than rewritten as a user denial; ACP
 futures and MCP synchronous consent workers are cancelled/released with it.
+Interruption wins a race with a concurrently arriving approval. Only the exact
+`once`, `session`, and `always` values grant authority; malformed, unknown, or
+mistyped callback/transport values fail closed.
 
 Gateway sessions send activity heartbeats while waiting so an otherwise healthy
 background run is not killed as idle. MCP transport deadlines exclude time spent
 waiting for elicitation consent, then resume after the decision; ordinary
-network timeouts still apply. A messaging platform may eventually disable stale
-buttons because its interaction token expired, but that UI event does not decide
-the approval—the platform's text approval/deny command remains available. An
+network timeouts still apply. Because MCP elicitation runs on the session
+receive loop rather than the tool-call task, Hermes also signals that waiter
+explicitly with a per-call cancellation token when the originating call is
+interrupted; queued concurrent calls cannot clear or consume another call's
+consent signal. A messaging platform may eventually disable stale buttons
+because its interaction token expired, but that UI event does not decide the
+approval—the platform's text approval/deny command remains available. An
 explicit session stop or process restart still interrupts the run; clients
 should surface that state and use their normal recovery path.
 

@@ -1443,7 +1443,12 @@ class ElicitationHandler:
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
         captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
-        consent_cancel = threading.Event()
+        consent_cancel = None
+        if self.owner is not None:
+            consent_cancel = getattr(self.owner, "_active_elicitation_cancel", None)
+            if consent_cancel is None:
+                consent_cancel = getattr(self.owner, "_elicitation_cancel", None)
+        consent_cancel = consent_cancel or threading.Event()
 
         def _invoke_consent() -> str:
             if captured is None:
@@ -1463,7 +1468,11 @@ class ElicitationHandler:
                 cancel_event=consent_cancel,
             )
 
-        pending_signal = getattr(self.owner, "_elicitation_pending", None) if self.owner is not None else None
+        pending_signal = None
+        if self.owner is not None:
+            pending_signal = getattr(self.owner, "_active_elicitation_pending", None)
+            if pending_signal is None:
+                pending_signal = getattr(self.owner, "_elicitation_pending", None)
         if pending_signal is not None:
             pending_signal.set()
         try:
@@ -1484,6 +1493,7 @@ class ElicitationHandler:
         finally:
             if pending_signal is not None:
                 pending_signal.clear()
+            consent_cancel.clear()
 
         if answer == "accept":
             self.metrics["accepted"] += 1
@@ -1516,7 +1526,8 @@ class MCPServerTask:
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "_pending_call_context", "_elicitation_pending",
+        "_pending_call_context", "_elicitation_pending", "_elicitation_cancel",
+        "_active_elicitation_pending", "_active_elicitation_cancel",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1567,6 +1578,12 @@ class MCPServerTask:
         # its transport deadline while a human approval is pending. Network
         # timeouts still apply before and after the decision.
         self._elicitation_pending = threading.Event()
+        # The SDK invokes elicitation on the session receive-loop task, not the
+        # tool-call task. Cancelling the RPC future therefore cannot stop the
+        # synchronous approval waiter by itself; this explicit signal does.
+        self._elicitation_cancel = threading.Event()
+        self._active_elicitation_pending: threading.Event | None = None
+        self._active_elicitation_cancel: threading.Event | None = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -3614,6 +3631,7 @@ def _run_on_mcp_loop(
     timeout: float | None = 30,
     *,
     deadline_pause: threading.Event | None = None,
+    cancellation_signal: threading.Event | None = None,
 ):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -3626,6 +3644,8 @@ def _run_on_mcp_loop(
     interrupts while the MCP work is still running on the background loop.
     When ``deadline_pause`` is set, time spent waiting for explicit human
     elicitation consent is excluded from the transport deadline.
+    ``cancellation_signal`` interrupts the receive-loop-owned elicitation
+    waiter when the calling tool task is interrupted or times out.
     """
     from tools.interrupt import is_interrupted
     from agent.async_utils import safe_schedule_threadsafe
@@ -3664,6 +3684,8 @@ def _run_on_mcp_loop(
 
     while True:
         if is_interrupted():
+            if cancellation_signal is not None:
+                cancellation_signal.set()
             future.cancel()
             raise InterruptedError("User sent a new message")
 
@@ -3676,6 +3698,8 @@ def _run_on_mcp_loop(
         if deadline is not None:
             remaining = deadline - now
             if remaining <= 0:
+                if cancellation_signal is not None:
+                    cancellation_signal.set()
                 future.cancel()
                 elapsed = time.monotonic() - start_time
                 assert timeout is not None
@@ -3943,9 +3967,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
-        async def _call():
+        async def _call(
+            call_elicitation_pending: threading.Event,
+            call_elicitation_cancel: threading.Event,
+        ):
             _mark_server_call_started(server)
             async with server._rpc_lock:
+                # Each serialized RPC owns its own consent signals. A queued or
+                # interrupted concurrent caller cannot clear/cancel the active
+                # call's receive-loop elicitation waiter. These events are
+                # created fresh in _call_once. Do not clear them here: the
+                # blocking caller can signal cancellation after scheduling but
+                # before this coroutine acquires the RPC lock.
+                if call_elicitation_cancel.is_set():
+                    raise asyncio.CancelledError
+                server._active_elicitation_pending = call_elicitation_pending
+                server._active_elicitation_cancel = call_elicitation_cancel
                 # Snapshot the agent's context so an elicitation callback
                 # triggered during this call (fired on the MCP recv loop
                 # task, which doesn't inherit our contextvars) can replay
@@ -3955,6 +3992,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
+                    if server._active_elicitation_pending is call_elicitation_pending:
+                        server._active_elicitation_pending = None
+                    if server._active_elicitation_cancel is call_elicitation_cancel:
+                        server._active_elicitation_cancel = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -4003,10 +4044,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
+            call_elicitation_pending = threading.Event()
+            call_elicitation_cancel = threading.Event()
             return _run_on_mcp_loop(
-                _call,
+                lambda: _call(call_elicitation_pending, call_elicitation_cancel),
                 timeout=tool_timeout,
-                deadline_pause=getattr(server, "_elicitation_pending", None),
+                deadline_pause=call_elicitation_pending,
+                cancellation_signal=call_elicitation_cancel,
             )
 
         try:

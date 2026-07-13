@@ -192,7 +192,11 @@ class TestElicitationHandlerWiring:
         from types import SimpleNamespace
 
         pending = threading.Event()
-        owner = SimpleNamespace(_pending_call_context=None, _elicitation_pending=pending)
+        owner = SimpleNamespace(
+            _pending_call_context=None,
+            _elicitation_pending=pending,
+            _elicitation_cancel=threading.Event(),
+        )
         handler = ElicitationHandler("pay", {}, owner=cast(Any, owner))
         observed = []
 
@@ -206,6 +210,68 @@ class TestElicitationHandlerWiring:
         assert result.action == "accept"
         assert observed == [True]
         assert not pending.is_set()
+
+    def test_owner_cancel_signal_releases_receive_loop_elicitation(self):
+        from types import SimpleNamespace
+
+        pending = threading.Event()
+        cancel = threading.Event()
+        owner = SimpleNamespace(
+            _pending_call_context=None,
+            _elicitation_pending=pending,
+            _elicitation_cancel=cancel,
+            _active_elicitation_pending=pending,
+            _active_elicitation_cancel=cancel,
+        )
+        handler = ElicitationHandler("pay", {}, owner=cast(Any, owner))
+        entered = threading.Event()
+
+        def consent(*_args, cancel_event=None, **_kwargs):
+            assert cancel_event is not None
+            assert cancel_event is cancel
+            entered.set()
+            assert cancel_event.wait(timeout=2)
+            return "cancel"
+
+        async def scenario():
+            with patch("tools.approval.request_elicitation_consent", side_effect=consent):
+                task = asyncio.create_task(handler(context=None, params=_form_params()))
+                assert await asyncio.to_thread(entered.wait, 1)
+                cancel.set()
+                result = await task
+                assert result.action == "cancel"
+                assert not pending.is_set()
+                assert not cancel.is_set()
+
+        asyncio.run(scenario())
+
+    def test_pre_signaled_active_cancel_is_not_cleared_by_handler_start(self):
+        from types import SimpleNamespace
+
+        pending = threading.Event()
+        cancel = threading.Event()
+        cancel.set()
+        owner = SimpleNamespace(
+            _pending_call_context=None,
+            _elicitation_pending=threading.Event(),
+            _elicitation_cancel=threading.Event(),
+            _active_elicitation_pending=pending,
+            _active_elicitation_cancel=cancel,
+        )
+        handler = ElicitationHandler("pay", {}, owner=cast(Any, owner))
+
+        def consent(*_args, cancel_event=None, **_kwargs):
+            assert cancel_event is not None
+            assert cancel_event is cancel
+            assert cancel_event.is_set()
+            return "cancel"
+
+        with patch("tools.approval.request_elicitation_consent", side_effect=consent):
+            result = asyncio.run(handler(context=None, params=_form_params()))
+
+        assert result.action == "cancel"
+        assert not pending.is_set()
+        assert not cancel.is_set()
 
     def test_disabled_config_does_not_construct_handler(self):
         """The server task initializer checks ``elicitation.enabled`` --

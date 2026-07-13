@@ -187,6 +187,28 @@ class TestApprovalBridge:
         assert result == "interrupted"
         future.cancel.assert_called_once_with()
 
+    def test_interrupt_wins_race_with_ready_allow_response(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+        scheduled = {}
+
+        def _schedule(coro, _passed_loop):
+            scheduled["coro"] = coro
+            return future
+
+        with patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule), \
+             patch("tools.interrupt.is_interrupted", side_effect=[False, True]):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            result = cb("rm -rf /", "dangerous command")
+
+        scheduled["coro"].close()
+        assert result == "interrupted"
+        future.cancel.assert_called_once_with()
+
     def test_none_response_returns_deny(self):
         """When request_permission resolves to None, the callback returns 'deny'."""
         loop = MagicMock(spec=asyncio.AbstractEventLoop)

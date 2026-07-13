@@ -292,7 +292,7 @@ def test_clear_session_boundary_security_state_is_scoped():
 
 
 def test_clear_session_boundary_security_state_wakes_blocked_approvals():
-    """Boundary cleanup must cancel blocked approval waiters immediately."""
+    """Boundary cleanup interrupts blocked waiters without recording denial."""
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
@@ -311,7 +311,7 @@ def test_clear_session_boundary_security_state_wakes_blocked_approvals():
     runner._clear_session_boundary_security_state(session_key)
 
     assert target_entry.event.is_set()
-    assert target_entry.result == "deny"
+    assert target_entry.result == "interrupted"
     assert other_entry.event.is_set() is False
     assert other_entry.result is None
     assert session_key not in approval_mod._gateway_queues

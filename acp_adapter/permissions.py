@@ -152,14 +152,22 @@ def make_approval_callback(
         try:
             from tools.interrupt import is_interrupted
             while True:
+                if is_interrupted():
+                    future.cancel()
+                    logger.info("Permission request interrupted before a decision")
+                    return "interrupted"
                 try:
                     response = future.result(timeout=0.25)
-                    break
                 except FutureTimeout:
-                    if is_interrupted():
-                        future.cancel()
-                        logger.info("Permission request interrupted before a decision")
-                        return "interrupted"
+                    continue
+                # Interruption wins races with an already-ready allow response.
+                # Once the operator stops the session, no concurrently arriving
+                # approval may revive the dangerous command.
+                if is_interrupted():
+                    future.cancel()
+                    logger.info("Permission request interrupted as its decision arrived")
+                    return "interrupted"
+                break
         except Exception as exc:
             future.cancel()
             logger.warning("Permission request failed: %s", exc)
