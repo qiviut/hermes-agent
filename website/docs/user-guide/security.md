@@ -154,7 +154,7 @@ approvals:
 
 ### What Triggers Approval
 
-The following patterns trigger approval prompts (defined in `tools/approval.py`):
+The following patterns trigger approval prompts (defined in `tools/approval_detection.py`):
 
 | Pattern | Description |
 |---------|-------------|
@@ -171,6 +171,7 @@ The following patterns trigger approval prompts (defined in `tools/approval.py`)
 | `TRUNCATE TABLE` | SQL TRUNCATE |
 | `> /etc/` | Overwrite system config |
 | `systemctl stop/restart/disable/mask` | Stop/restart/disable system services |
+| `shutdown` / `reboot` / `halt` / `poweroff`, `init 0/6`, `systemctl poweroff/reboot/halt/kexec` | System power/lifecycle change |
 | `kill -9 -1` | Kill all processes |
 | `pkill -9` | Force kill processes |
 | Fork bomb patterns | Fork bombs |

@@ -90,7 +90,14 @@ _HARDLINE_BLOCK = [
     # System-wide kill
     "kill -9 -1",
     "kill -1",
-    # Shutdown / reboot / halt
+    # System power/lifecycle commands are approval-gated, not hardline-blocked.
+]
+
+
+# System power/lifecycle commands are disruptive but recoverable after a successful boot.
+# They must reach the normal dangerous-command approval tier, including shell wrappers and
+# command-position variants, without weakening the hardline floor for irreversible operations.
+_APPROVAL_GATED_SYSTEM_POWER = [
     "shutdown -h now",
     "shutdown -r now",
     "sudo shutdown now",
@@ -104,7 +111,8 @@ _HARDLINE_BLOCK = [
     "systemctl poweroff",
     "systemctl reboot",
     "systemctl halt",
-    # Compound / subshell variants
+    "systemctl kexec",
+    "systemctl --no-block reboot",
     "ls; reboot",
     "echo done && shutdown -h now",
     "false || halt",
@@ -115,10 +123,6 @@ _HARDLINE_BLOCK = [
     "exec shutdown",
     "nohup reboot",
     "setsid poweroff",
-    # Bare subshell `(cmd)` and brace-group `{ cmd; }` openers put the trigger
-    # at a real command position, so they must hit the floor just like `$(…)`.
-    # These slipped through before the quote-aware command-start tokenizer
-    # learned to recognize `(` / `{` (issue: (reboot) walked past --yolo).
     "(reboot)",
     "( reboot )",
     "(shutdown -h now)",
@@ -210,6 +214,17 @@ def test_hardline_detection_blocks(command):
     assert desc, "hardline match must provide a description"
 
 
+@pytest.mark.parametrize("command", _APPROVAL_GATED_SYSTEM_POWER)
+def test_system_power_is_dangerous_but_not_hardline(command):
+    """System power changes require approval but are not an unconditional floor."""
+    is_hardline, hardline_desc = detect_hardline_command(command)
+    assert not is_hardline, f"system power command incorrectly hardline-blocked: {command!r} ({hardline_desc})"
+
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    assert is_dangerous, f"system power command bypassed dangerous detection: {command!r}"
+    assert pattern_key == description == "system shutdown/reboot"
+
+
 @pytest.mark.parametrize("command", _HARDLINE_ALLOW)
 def test_hardline_detection_allows(command):
     is_hl, desc = detect_hardline_command(command)
@@ -263,8 +278,9 @@ _QUOTED_NEWLINE_DATA_ALLOW = [
 ]
 
 # The masking must be strictly scoped to quoted data: real command
-# boundaries around/inside those same shapes still hit the floor.
-_QUOTED_NEWLINE_THREATS_BLOCK = [
+# boundaries around/inside those same shapes still trigger the system-power
+# dangerous-command detector.
+_QUOTED_NEWLINE_POWER_THREATS = [
     # unquoted newline is a real command separator
     "echo hi\nsudo reboot",
     'echo "a"\nsudo reboot',
@@ -289,12 +305,14 @@ def test_quoted_newline_data_not_blocked(command):
     )
 
 
-@pytest.mark.parametrize("command", _QUOTED_NEWLINE_THREATS_BLOCK)
-def test_real_newline_separated_threats_still_blocked(command):
+@pytest.mark.parametrize("command", _QUOTED_NEWLINE_POWER_THREATS)
+def test_real_newline_separated_power_commands_still_detected(command):
     """Unquoted newlines / $() / backticks remain real command boundaries."""
-    is_hl, desc = detect_hardline_command(command)
-    assert is_hl, f"real threat leaked through hardline floor: {command!r}"
-    assert desc
+    is_hl, hardline_desc = detect_hardline_command(command)
+    assert not is_hl, f"approval-gated power command incorrectly became hardline: {command!r} ({hardline_desc})"
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    assert is_dangerous, f"real power command escaped dangerous detection: {command!r}"
+    assert pattern_key == description == "system shutdown/reboot"
 
 
 def test_quoted_newline_data_not_blocked_by_full_guard_chain(clean_session):
@@ -566,7 +584,7 @@ def test_yolo_env_var_cannot_bypass_hardline(clean_session, monkeypatch):
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
     for cmd in ['rm -rf /', 'rm -rf "/"', 'rm -rf "$HOME"', "rm -rf ${HOME}",
-                "shutdown -h now", "mkfs.ext4 /dev/sda", "reboot"]:
+                "mkfs.ext4 /dev/sda"]:
         r1 = check_dangerous_command(cmd, "local")
         assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
         assert r1.get("hardline") is True
@@ -610,17 +628,12 @@ def test_root_collapse_pattern_leaves_real_paths_alone(clean_session):
 
 def test_subshell_brace_group_cannot_bypass_hardline(clean_session, monkeypatch):
     """Wrapping a catastrophic command in `(…)` or `{ …; }` must not bypass
-    the floor, even under yolo. `(reboot)` / `{ shutdown -h now; }` walked
-    straight past the guard before the command-start tokenizer recognized the
-    subshell and brace-group openers.
+    the floor, even under yolo. The command-start tokenizer recognizes
+    subshell and brace-group openers without weakening the floor.
     """
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
-    for cmd in ["(reboot)", "( reboot )", "(shutdown -h now)", "(poweroff)",
-                "(systemctl reboot)", "(init 0)", "(sudo reboot)",
-                "{ reboot; }", "{ shutdown -h now; }", "{ poweroff; }",
-                "(rm -rf /)", "{ rm -rf /; }", "(rm -rf ~)",
-                "true && (reboot)", "echo hi; { reboot; }"]:
+    for cmd in ["(rm -rf /)", "{ rm -rf /; }", "(rm -rf ~)"]:
         r1 = check_dangerous_command(cmd, "local")
         assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
         assert r1.get("hardline") is True

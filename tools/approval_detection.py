@@ -52,12 +52,12 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # Commands that NEVER run via the agent, regardless of --yolo, approvals.mode=off, or cron approve
 # mode — a floor below yolo. Applies only to environments that can damage the host (local, ssh,
 # container-host cron); containerized backends already bypass the dangerous-command layer.
-# Deliberately tiny: only things with no recovery path (root wipe, raw block device writes,
-# shutdown, DoS). Recoverable operations (git reset --hard, chmod -R 777, curl|sh) stay in
-# DANGEROUS_PATTERNS.
+# Deliberately tiny: only things with no recovery path (root wipe, raw block-device writes,
+# filesystem destruction, fork bombs, kill-all). Recoverable-but-disruptive lifecycle operations
+# (shutdown/reboot) stay in DANGEROUS_PATTERNS where an explicit operator approval can authorize them.
 
 # Start-of-command position: start of string, newline, subshell opener ($( or backtick), optionally consuming
-# sudo/env/exec/nohup/setsid/time wrappers. Keeps shutdown/reboot rules from firing on "echo reboot" / "grep
+# sudo/env/exec/nohup/setsid/time wrappers. Keeps command-name rules from firing on "echo reboot" / "grep
 # 'shutdown' log". Real ;/&/| separators are converted to newlines by the quote-aware _mark_command_starts pass;
 # keeping them here mistakes quoted data (grep '(safe|rm -rf /)') for commands.
 _CMDPOS = (
@@ -91,7 +91,7 @@ HARDLINE_PATTERNS = [
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'/(?:(?:\.\.?)?/)*(?:\.\.?)?\**|/ \*'), "recursive delete of root filesystem"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(_HARDLINE_SYSTEM_DIRS), "recursive delete of system directory"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~|\$\{?HOME\}?)(?:/?|/\*)?'), "recursive delete of home directory"),
-    # Command-name rules (mkfs, dd, kill, shutdown...) are _CMDPOS-anchored so quoted prose
+    # Command-name rules (mkfs, dd, kill...) are _CMDPOS-anchored so quoted prose
     # (`echo "does this use mkfs?"`) cannot trip the floor.
     # See #93392.
     (_CMDPOS + r'mkfs(\.[a-z0-9]+)?\b', "format filesystem (mkfs)"),
@@ -112,10 +112,8 @@ HARDLINE_PATTERNS = [
     # Kill every process on the system — anchor the command-name token so `echo "kill -1 sends SIGHUP to
     # everything"` doesn't trip (#93392).
     (_CMDPOS + r'kill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
-    (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
-    (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
-    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
-    (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # System power/lifecycle commands are disruptive but recoverable after a successful boot;
+    # they are approval-gated in DANGEROUS_PATTERNS rather than unconditionally hardline-blocked.
 ]
 
 # Pre-compiled at module load so the hot-path matcher never pays the cold re.compile fan-out
@@ -269,6 +267,12 @@ DANGEROUS_PATTERNS = [
     (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
+    # System power/lifecycle operations are disruptive but recoverable after a successful boot.
+    # Keep the command-position anchor so quoted prose such as `echo "reboot"` stays harmless.
+    (_CMDPOS + r'(?:shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
+    (_CMDPOS + r'init\s+[06]\b', "system shutdown/reboot"),
+    (_CMDPOS + r'systemctl\s+(?:-[^\s]+\s+)*(?:poweroff|reboot|halt|kexec)\b', "system shutdown/reboot"),
+    (_CMDPOS + r'telinit\s+[06]\b', "system shutdown/reboot"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
