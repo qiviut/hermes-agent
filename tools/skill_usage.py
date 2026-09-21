@@ -461,6 +461,25 @@ def bump_view(skill_name: str) -> None:
     _mutate(skill_name, lambda rec: _bump(rec, "view_count", "last_viewed_at"))
 
 
+def record_outcome(skill_name: str, outcome: str, *, task_id: Optional[str] = None,
+                   session_id: Optional[str] = None) -> bool:
+    """Best-effort agent-facing write for one local post-use outcome event."""
+    try:
+        from tools.skill_outcomes import record_outcome as _record_outcome
+        _record_outcome(
+            skill_name,
+            outcome,
+            task_id=task_id,
+            session_id=session_id,
+            provenance=telemetry_provenance(skill_name),
+            source="agent",
+        )
+        return True
+    except Exception:
+        logger.debug("skill_usage.record_outcome failed for %s", skill_name, exc_info=True)
+        return False
+
+
 def bump_use(skill_name: str, *, task_id: Optional[str] = None, session_id: Optional[str] = None) -> None:
     """Skill actively used (loaded into the prompt path / referenced from an assistant turn)."""
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:

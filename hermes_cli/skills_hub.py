@@ -159,6 +159,55 @@ def _report_ok(c: Console, result: dict, fallback: str = "") -> bool:
     return False
 
 
+def do_record_outcome(
+    skill_name: str, outcome: str, *, session_id: str = "", task_id: str = "",
+    as_json: bool = False, console: Console | None = None,
+) -> bool:
+    """Write one bounded local post-use outcome event."""
+    from tools.skill_outcomes import record_outcome
+    c = console or _console
+    try:
+        event = record_outcome(
+            skill_name, outcome, session_id=session_id, task_id=task_id, source="cli",
+        )
+    except Exception as exc:
+        c.print(f"[bold red]Error:[/] unable to record skill outcome: {exc}")
+        return False
+    if as_json:
+        c.print(json.dumps(event, sort_keys=True), markup=False)
+    else:
+        c.print(f"[bold green]Recorded[/] {event['outcome']} for {event['skill_tag']}.")
+    return True
+
+
+def do_outcomes(
+    *, skill_name: str = "", outcome: str | None = None, limit: int = 100,
+    as_json: bool = False, console: Console | None = None,
+) -> list[dict[str, Any]]:
+    """Read bounded local post-use outcome events."""
+    from tools.skill_outcomes import read_outcomes
+    c = console or _console
+    try:
+        rows = read_outcomes(skill_name=skill_name or None, outcome=outcome, limit=limit)
+    except Exception as exc:
+        c.print(f"[bold red]Error:[/] unable to read skill outcomes: {exc}")
+        return []
+    if as_json:
+        c.print(json.dumps(rows, sort_keys=True), markup=False)
+        return rows
+    if not rows:
+        c.print("[dim]No local skill outcomes recorded.[/]")
+        return rows
+    table = _table("Recorded", "Outcome", "Skill", "Session tag", "Task tag", title="Skill outcomes")
+    for row in rows:
+        table.add_row(
+            row["recorded_at"], row["outcome"], row["skill_tag"],
+            row["session_tag"], row["task_tag"],
+        )
+    c.print(table)
+    return rows
+
+
 def _skill_md_preview(bundle) -> Optional[str]:
     """First 50 lines of the bundle's SKILL.md (None when absent)."""
     if not bundle or "SKILL.md" not in bundle.files:
@@ -1313,6 +1362,14 @@ _CLI_ACTIONS = {
     "inspect": lambda a: do_inspect(a.identifier),
     "list": lambda a: do_list(source_filter=a.source,
                               enabled_only=getattr(a, "enabled_only", False)),
+    "outcome": lambda a: do_record_outcome(
+        a.skill, a.outcome, session_id=getattr(a, "session_id", ""),
+        task_id=getattr(a, "task_id", ""), as_json=getattr(a, "json", False),
+    ),
+    "outcomes": lambda a: do_outcomes(
+        skill_name=getattr(a, "skill", ""), outcome=getattr(a, "outcome", None),
+        limit=getattr(a, "limit", 100), as_json=getattr(a, "json", False),
+    ),
     "check": lambda a: do_check(name=getattr(a, "name", None)),
     "update": lambda a: do_update(name=getattr(a, "name", None), force=getattr(a, "force", False)),
     "audit": lambda a: do_audit(name=getattr(a, "name", None), deep=getattr(a, "deep", False)),
@@ -1335,7 +1392,7 @@ def skills_command(args) -> None:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     handler = _CLI_ACTIONS.get(getattr(args, "skills_action", None))
     if handler is None:
-        _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|outcome|outcomes|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
         return
     handler(args)
@@ -1478,6 +1535,8 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
         "       List installed skills; --enabled-only filters to the active profile's live set\n"
+        "  [cyan]outcome[/] <skill> <outcome>   Record a local post-use outcome\n"
+        "  [cyan]outcomes[/] [--skill NAME]     Report local post-use outcomes\n"
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
         "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
         "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hermes-agent:schema:skill-outcome:v1",
+  "title": "Hermes Local Skill Outcome Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "recorded_at",
+    "outcome",
+    "skill_tag",
+    "provenance",
+    "session_tag",
+    "task_tag",
+    "source"
+  ],
+  "properties": {
+    "schema_version": {"const": "hermes.skill.outcome.v1"},
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "outcome": {
+      "type": "string",
+      "enum": ["accepted", "corrected", "blocked", "abandoned", "reverted", "ignored"]
+    },
+    "skill_tag": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(unknown|sha256:[0-9a-f]{16}|[a-z0-9][a-z0-9._:/@+\\-]{0,127})$"
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["agent_created", "external", "installed", "local", "unknown"]
+    },
+    "session_tag": {
+      "type": "string",
+      "pattern": "^(unknown|sha256:[0-9a-f]{16})$"
+    },
+    "task_tag": {
+      "type": "string",
+      "pattern": "^(unknown|sha256:[0-9a-f]{16})$"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["agent", "cli", "user", "unknown"]
+    }
+  }
+}

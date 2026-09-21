@@ -72,6 +72,25 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         help="Hide disabled skills. Use with -p <profile> to see exactly "
         "which skills will load for that profile.")
 
+    skills_outcome = skills_subparsers.add_parser(
+        "outcome", help="Record one local post-use skill outcome")
+    skills_outcome.add_argument("skill", help="Skill name or bounded attribution")
+    skills_outcome.add_argument(
+        "outcome", choices=["accepted", "corrected", "blocked", "abandoned", "reverted", "ignored"],
+        help="Observed post-use outcome")
+    skills_outcome.add_argument("--session-id", default="", help="Opaque session identifier; stored only as a hash")
+    skills_outcome.add_argument("--task-id", default="", help="Opaque task identifier; stored only as a hash")
+    add_json_flag(skills_outcome, "Output the persisted event as JSON")
+
+    skills_outcomes = skills_subparsers.add_parser(
+        "outcomes", help="Report local post-use skill outcomes")
+    skills_outcomes.add_argument("--skill", default="", help="Filter by skill name")
+    skills_outcomes.add_argument(
+        "--outcome", choices=["accepted", "corrected", "blocked", "abandoned", "reverted", "ignored"],
+        default=None, help="Filter by observed outcome")
+    skills_outcomes.add_argument("--limit", type=int, default=100, help="Newest events to return (default: 100)")
+    add_json_flag(skills_outcomes, "Output JSON instead of a table")
+
     skills_check = skills_subparsers.add_parser(
         "check", help="Check installed hub skills for updates")
     skills_check.add_argument("name", nargs="?", help="Specific skill to check (default: all)")

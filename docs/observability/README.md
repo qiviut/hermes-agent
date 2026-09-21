@@ -18,6 +18,10 @@ Hermes also has a first-party NeMo Relay shared-metrics path. It uses these
 lifecycle boundaries directly and does not require enabling an observability
 plugin. See [Relay shared metrics](relay-shared-metrics.md).
 
+For local post-use evidence that load counts cannot provide, see [Local Skill
+Outcome Events](skill-outcomes.md). The outcome ledger is bounded, profile-local,
+and deliberately excluded from Relay packages.
+
 ## Contract
 
 Plugins register observer callbacks from `register(ctx)`:

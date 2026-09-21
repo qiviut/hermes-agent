@@ -203,8 +203,11 @@ continuity transactionally in its existing `skills/.usage.json` state; skill
 names and exact counts or generations never enter Relay metrics events,
 SQLite dimensions, or packages. A use after a new patch is counted once as
 `reused_after_patch`; later uses remain ordinary reuse until another patch.
-Task-outcome attribution after a patch remains deferred until its window and
-multi-skill semantics are defined.
+Post-use skill outcomes are recorded only in the local bounded ledger described
+in [Local Skill Outcome Events](skill-outcomes.md). They are deliberately not
+added to Relay metrics packages: the local event carries bounded skill
+attribution and hashed session/task tags, while causal multi-skill attribution
+still requires cohort review.
 
 Local state is written under:
 
