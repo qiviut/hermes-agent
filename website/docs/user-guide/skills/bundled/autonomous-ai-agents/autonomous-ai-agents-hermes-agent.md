@@ -15,7 +15,7 @@ Use, configure, theme, extend, and orchestrate Hermes Agent.
 | | |
 |---|---|
 | Source | Bundled (installed by default) |
-| Path | `skills/autonomous-ai-agents\hermes-agent` |
+| Path | `skills/autonomous-ai-agents/hermes-agent` |
 | Version | `3.2.0` |
 | Author | Hermes Agent + Teknium |
 | License | MIT |
@@ -111,6 +111,7 @@ Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile i
 | In-session slash commands | `references/slash-commands.md` |
 | Provider setup, API keys, OAuth | `references/providers-and-models.md` |
 | config.yaml sections, toolsets, voice/STT/TTS | `references/configuration.md` |
+| GPT-5.6 model routing and realistic timeout budgets | `references/model-routing-and-timeouts.md` |
 | AGENTS.md / .hermes.md / CLAUDE.md project rules | `references/project-context-files.md` |
 | Secret redaction, PII, approval modes, "reset permissions" | `references/security-privacy.md` |
 | Delegation, cron, curator, kanban | `references/background-systems.md` |
@@ -150,9 +151,9 @@ Run additional Hermes processes as fully independent subprocesses — separate s
 ### One-Shot Mode
 
 ```
-terminal(command="hermes chat -q 'Research GRPO papers and write summary to ~/research/grpo.md'", timeout=300)
+terminal(command="hermes chat -q 'Research GRPO papers and write summary to ~/research/grpo.md'", timeout=900)
 
-# Background for long tasks:
+# Background for work that may run longer than one foreground window:
 terminal(command="hermes chat -q 'Set up CI/CD for ~/myapp'", background=true)
 ```
 
@@ -161,53 +162,53 @@ terminal(command="hermes chat -q 'Set up CI/CD for ~/myapp'", background=true)
 Hermes uses prompt_toolkit, which requires a real terminal. Use tmux for interactive spawning:
 
 ```
-# Start
-terminal(command="tmux new-session -d -s agent1 -x 120 -y 40 'hermes'", timeout=10)
+# Start the control process; the foreground command itself should be quick.
+terminal(command="tmux new-session -d -s agent1 -x 120 -y 40 'hermes'", timeout=30)
 
-# Wait for startup, then send a message
-terminal(command="sleep 8 && tmux send-keys -t agent1 'Build a FastAPI auth service' Enter", timeout=15)
+# Allow a slow first start, then send the task.
+terminal(command="sleep 20 && tmux send-keys -t agent1 'Build a FastAPI auth service' Enter", timeout=60)
 
-# Read output
-terminal(command="sleep 20 && tmux capture-pane -t agent1 -p", timeout=5)
+# Poll output with enough time for model/provider startup.
+terminal(command="sleep 30 && tmux capture-pane -t agent1 -p", timeout=90)
 
-# Send follow-up
-terminal(command="tmux send-keys -t agent1 'Add rate limiting middleware' Enter", timeout=5)
+# Send follow-up; the agent continues in tmux after this control call returns.
+terminal(command="tmux send-keys -t agent1 'Add rate limiting middleware' Enter", timeout=30)
 
-# Exit
-terminal(command="tmux send-keys -t agent1 '/exit' Enter && sleep 2 && tmux kill-session -t agent1", timeout=10)
+# Exit only after inspecting the pane; allow graceful cleanup.
+terminal(command="tmux send-keys -t agent1 '/exit' Enter && sleep 5 && tmux kill-session -t agent1", timeout=60)
 ```
 
 ### Multi-Agent Coordination
 
 ```
 # Agent A: backend
-terminal(command="tmux new-session -d -s backend -x 120 -y 40 'hermes -w'", timeout=10)
-terminal(command="sleep 8 && tmux send-keys -t backend 'Build REST API for user management' Enter", timeout=15)
+terminal(command="tmux new-session -d -s backend -x 120 -y 40 'hermes -w'", timeout=30)
+terminal(command="sleep 20 && tmux send-keys -t backend 'Build REST API for user management' Enter", timeout=60)
 
 # Agent B: frontend
-terminal(command="tmux new-session -d -s frontend -x 120 -y 40 'hermes -w'", timeout=10)
-terminal(command="sleep 8 && tmux send-keys -t frontend 'Build React dashboard for user management' Enter", timeout=15)
+terminal(command="tmux new-session -d -s frontend -x 120 -y 40 'hermes -w'", timeout=30)
+terminal(command="sleep 20 && tmux send-keys -t frontend 'Build React dashboard for user management' Enter", timeout=60)
 
-# Check progress, relay context between them
-terminal(command="tmux capture-pane -t backend -p | tail -30", timeout=5)
-terminal(command="tmux send-keys -t frontend 'Here is the API schema from the backend agent: ...' Enter", timeout=5)
+# Check progress and relay context between them
+terminal(command="sleep 30 && tmux capture-pane -t backend -p | tail -30", timeout=90)
+terminal(command="tmux send-keys -t frontend 'Here is the API schema from the backend: ...' Enter", timeout=30)
 ```
 
 ### Session Resume
 
 ```
 # Resume most recent session
-terminal(command="tmux new-session -d -s resumed 'hermes --continue'", timeout=10)
+terminal(command="tmux new-session -d -s resumed 'hermes --continue'", timeout=30)
 
 # Resume specific session
-terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_143052_a1b2c3'", timeout=10)
+terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_143052_a1b2c3'", timeout=30)
 ```
 
 ### Tips
 
 - **Prefer `delegate_task` for quick subtasks** — less overhead than spawning a full process
 - **Use `-w` (worktree mode)** when spawning agents that edit code — prevents git conflicts
-- **Set timeouts** for one-shot mode — complex tasks can take 5-10 minutes
+- **Set realistic outer timeouts** — use about 900s for a substantial foreground run and background/tmux for work that may exceed it; the timeout is not the agent's lifetime.
 - **Use `hermes chat -q` for fire-and-forget** — no PTY needed
 - **Use tmux for interactive sessions** — raw PTY mode has `\r` vs `\n` issues with prompt_toolkit
 - **For scheduled tasks**, use the `cronjob` tool instead of spawning — handles delivery and retry
